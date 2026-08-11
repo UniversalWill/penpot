@@ -1279,6 +1279,33 @@ impl Surfaces {
         canvas.restore();
     }
 
+    /// Debug: semi-transparent tint unique per tile coords, baked into Current
+    /// before atlas/backbuffer blit so tile boundaries are visible on screen.
+    pub fn paint_debug_tile_overlay(&mut self, tile: &Tile) {
+        let rect = skia::Rect::from(self.drawable_irect());
+        let canvas = self.current.canvas();
+
+        // Stable pseudo-random RGB from tile coords (same tile → same color).
+        let h = (tile.x() as u32)
+            .wrapping_mul(374761393)
+            .wrapping_add((tile.y() as u32).wrapping_mul(668265263))
+            .wrapping_add(0x9E37_79B9);
+        let r = ((h >> 0) & 0xFF) as u8;
+        let g = ((h >> 8) & 0xFF) as u8;
+        let b = ((h >> 16) & 0xFF) as u8;
+
+        let mut paint = skia::Paint::default();
+        paint.set_anti_alias(true);
+        paint.set_style(skia::PaintStyle::Fill);
+        paint.set_color(skia::Color::from_argb(96, r, g, b));
+        canvas.draw_rect(rect, &paint);
+
+        paint.set_style(skia::PaintStyle::Stroke);
+        paint.set_stroke_width(2.0);
+        paint.set_color(skia::Color::from_argb(220, r, g, b));
+        canvas.draw_rect(rect, &paint);
+    }
+
     pub fn draw_current_tile_into_tile_atlas(
         &mut self,
         tile_viewbox: &TileViewbox,
@@ -1287,6 +1314,8 @@ impl Surfaces {
         skip_cache_surface: bool,
         tile_doc_rect: skia::Rect,
     ) {
+        self.paint_debug_tile_overlay(tile);
+
         let gpu_state = get_gpu_state();
         let src = skia::Rect::from(self.drawable_irect());
         let sampling = self.sampling_options;

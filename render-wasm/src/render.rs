@@ -1072,10 +1072,16 @@ impl RenderState {
     }
 
     pub fn apply_render_to_final_canvas(&mut self) -> Result<()> {
+        let current_tile = *self
+            .current_tile
+            .as_ref()
+            .ok_or(Error::CriticalError("Current tile not found".to_string()))?;
+
         // During interactive transforms we render tiles directly into Target; updating the cache
         // (snapshot -> atlas blit -> tiles.add) can force GPU stalls. Defer cache rebuild until
         // the interaction ends.
         if self.options.is_interactive_transform() {
+            self.surfaces.paint_debug_tile_overlay(&current_tile);
             let tile_rect = self.get_current_aligned_tile_bounds()?;
             self.surfaces.draw_current_tile_into_backbuffer(
                 &tile_rect,
@@ -1088,6 +1094,7 @@ impl RenderState {
         // Viewer masked passes render a partial scene. Reusing the tile texture cache would
         // SrcOver-blend onto textures from the previous pass and leak pixels into the blob.
         if self.viewer_masked_pass() {
+            self.surfaces.paint_debug_tile_overlay(&current_tile);
             // Use viewbox-aligned bounds (not grid-snapped) to match interactive-transform
             // compositing and avoid a visible offset vs the DOM canvas.
             let tile_rect = self.get_current_tile_bounds()?;
@@ -1110,11 +1117,6 @@ impl RenderState {
         // In fast mode the viewport is moving (pan/zoom) so Cache surface
         // positions would be wrong — only save to the tile HashMap.
         let tile_rect = self.get_current_aligned_tile_bounds()?;
-
-        let current_tile = *self
-            .current_tile
-            .as_ref()
-            .ok_or(Error::CriticalError("Current tile not found".to_string()))?;
 
         if self.tile_atlas_flushed {
             crate::get_gpu_state().context.flush_and_submit();
@@ -3887,6 +3889,7 @@ impl RenderState {
                         if self.options.is_interactive_transform() {
                             // During drag, avoid snapshot-based caching. Draw Current directly
                             // into Target (and Cache) to reduce stalls.
+                            self.surfaces.paint_debug_tile_overlay(&current_tile);
                             self.surfaces.draw_current_tile_into_backbuffer(
                                 &tile_rect,
                                 self.background_color,
