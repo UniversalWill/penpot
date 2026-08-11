@@ -23,6 +23,8 @@
 - Surfaces allocate with `effective_paint_tile_size` = `min(paint, atlas_slot max)` so
   DPR 2 on a 4096² atlas paints 512 (not 1024→downscale-to-512). Overpainting the atlas
   was pure GPU waste on zoom settle.
+- Raster `Fill::Image`: skip `save_layer` unless the shape has an image filter; plain
+  Rect/Frame (no corners) also skip the container clip (`draw_image_fill` in fills.rs).
 - Scales: `get_paint_scale()` matches tile CTM; `get_view_scale()` is `zoom×dpr` for
   viewport/backbuffer mapping. `get_scale()` is an alias of paint scale (legacy name).
 - Zoom settle: visible tiles present via `FrameType::ViewportReady` before interest-ring
