@@ -63,8 +63,14 @@ impl Viewbox {
 
     pub fn set_wh(&mut self, width: f32, height: f32) {
         self.size.set(width, height);
-        self.area
-            .set_wh(self.size.width / self.zoom, self.size.height / self.zoom);
+        // Keep pan origin. skia::Rect::set_wh resets to (0,0,w,h) and would
+        // drop the viewport pan on every resize/DPR change (browser zoom).
+        self.area.set_xywh(
+            -self.pan.x,
+            -self.pan.y,
+            self.size.width / self.zoom,
+            self.size.height / self.zoom,
+        );
     }
 
     pub fn set_dpr(&mut self, dpr: f32) {

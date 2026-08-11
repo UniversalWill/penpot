@@ -555,7 +555,7 @@ impl RenderState {
         let surfaces = Surfaces::try_new(
             (width, height),
             sampling_options,
-            tiles::get_tile_dimensions(),
+            tiles::get_tile_dimensions(1.0),
         )?;
 
         Self::assemble(width, height, surfaces)
@@ -876,15 +876,27 @@ impl RenderState {
         // Only when this function returns true (it means the value
         // was properly changed) the rest of the functions is called.
         if self.options.set_dpr(dpr) {
+            // Grid is zoom-only; interest is a tile-count margin (not ×dpr).
             self.tile_viewbox
                 .set_interest(self.options.dpr_viewport_interest_area_threshold);
+            self.viewbox.set_dpr(dpr);
+            get_resources().fonts.set_scale_debug_font(dpr);
+
+            // Viewport surfaces (Target/Backbuffer) scale with CSS×dpr.
             self.resize(
                 self.viewbox.width().floor() as i32,
                 self.viewbox.height().floor() as i32,
             )?;
-            get_resources().fonts.set_scale_debug_font(dpr);
-            self.viewbox.set_dpr(dpr);
-            self.surfaces.set_dpr(dpr);
+
+            // Grow/shrink physical tile work surfaces when density changes.
+            let _ = self.surfaces.set_dpr(dpr)?;
+
+            // Always drop cached tile textures on DPR change so we never
+            // composite stale device-scale tiles after browser zoom.
+            self.surfaces.invalidate_tile_cache();
+            self.tile_viewbox.update(&self.viewbox);
+            self.cached_viewbox = self.viewbox;
+            self.surfaces.clear_backbuffer(self.background_color);
         }
         Ok(())
     }
@@ -1999,8 +2011,11 @@ impl RenderState {
 
     pub fn update_render_context(&mut self, tile: tiles::Tile) {
         self.current_tile = Some(tile);
-        let scale = self.get_scale();
-        self.render_area = tiles::get_tile_rect(tile, scale);
+        let zoom = self.viewbox.zoom();
+        // Fill the integer GPU tile exactly (must match `get_scale` / paint CTM).
+        let scale = self.get_paint_scale();
+        // Doc-space tile rect depends only on zoom (DPR-independent grid).
+        self.render_area = tiles::get_tile_rect(tile, zoom);
         let margins = self.surfaces.margins();
         let margin_w = margins.width as f32 / scale;
         let margin_h = margins.height as f32 / scale;
@@ -2022,7 +2037,7 @@ impl RenderState {
         // ANY other candidate to guarantee the pixels under their bounds belong exclusively
         // to that shape in Backbuffer.
         let viewport = self.viewbox.area;
-        let scale = self.get_scale();
+        let scale = self.get_view_scale();
         let mut candidates: Vec<(Uuid, Rect, Rect)> = Vec::new(); // (id, doc_bounds, selrect)
 
         let root_ids: Vec<Uuid> = match tree.get(&Uuid::nil()) {
@@ -2940,11 +2955,12 @@ impl RenderState {
             .current_tile
             .ok_or(Error::CriticalError("Current tile not found".to_string()))?;
         let offset = self.viewbox.get_offset();
-        Ok(tile.get_rect_with_offset(&offset))
+        let screen = tiles::screen_tile_size(self.viewbox.dpr);
+        Ok(tile.get_rect_with_offset(&offset, screen))
     }
 
     pub fn get_rect_bounds(&mut self, rect: skia::Rect) -> Rect {
-        let scale = self.get_scale();
+        let scale = self.get_view_scale();
         let offset_x = self.viewbox.area.left * scale;
         let offset_y = self.viewbox.area.top * scale;
         Rect::from_xywh(
@@ -2961,22 +2977,21 @@ impl RenderState {
     }
 
     pub fn get_shape_extrect_bounds(&mut self, shape: &Shape, tree: ShapesPoolRef) -> Rect {
-        let scale = self.get_scale();
+        let scale = self.get_paint_scale();
         let rect = self.get_cached_extrect(shape, tree, scale);
         self.get_rect_bounds(rect)
     }
 
     pub fn get_aligned_tile_bounds(&mut self, tile: tiles::Tile) -> Rect {
-        let scale = self.get_scale();
-        let start_tile_x =
-            (self.viewbox.area.left * scale / tiles::TILE_SIZE).floor() * tiles::TILE_SIZE;
-        let start_tile_y =
-            (self.viewbox.area.top * scale / tiles::TILE_SIZE).floor() * tiles::TILE_SIZE;
+        let scale = self.get_view_scale();
+        let screen = tiles::screen_tile_size(self.viewbox.dpr);
+        let start_tile_x = (self.viewbox.area.left * scale / screen).floor() * screen;
+        let start_tile_y = (self.viewbox.area.top * scale / screen).floor() * screen;
         Rect::from_xywh(
-            (tile.x() as f32 * tiles::TILE_SIZE) - start_tile_x,
-            (tile.y() as f32 * tiles::TILE_SIZE) - start_tile_y,
-            tiles::TILE_SIZE,
-            tiles::TILE_SIZE,
+            (tile.x() as f32 * screen) - start_tile_x,
+            (tile.y() as f32 * screen) - start_tile_y,
+            screen,
+            screen,
         )
     }
 
@@ -2985,9 +3000,7 @@ impl RenderState {
     //
     // Unlike `get_current_tile_bounds`, which calculates bounds using the exact
     // scaled offset of the viewbox, this method snaps the origin to the nearest
-    // lower multiple of `TILE_SIZE`. This ensures the tile bounds are aligned
-    // with the global tile grid, which is useful for rendering tiles in a
-    /// consistent and predictable layout.
+    // lower multiple of the screen tile size (`512 × dpr`).
     pub fn get_current_aligned_tile_bounds(&mut self) -> Result<Rect> {
         Ok(self.get_aligned_tile_bounds(
             self.current_tile
@@ -3973,9 +3986,10 @@ impl RenderState {
      * render_shape_tree_partial_uncached, ensuring all shapes render correctly.
      */
     pub fn get_tiles_for_shape(&mut self, shape: &Shape, tree: ShapesPoolRef) -> TileRect {
-        let scale = self.get_scale();
-        let extrect = self.get_cached_extrect(shape, tree, scale);
-        let tile_size = tiles::get_tile_size(scale);
+        let zoom = self.viewbox.zoom();
+        // Extents and tile size use zoom only so the grid is DPR-independent.
+        let extrect = self.get_cached_extrect(shape, tree, zoom);
+        let tile_size = tiles::get_tile_size(zoom);
         let shape_tiles = tiles::get_tiles_for_rect(extrect, tile_size);
         let interest_rect = &self.tile_viewbox.interest_rect;
         // Calculate the intersection of shape_tiles with interest_rect
@@ -4289,12 +4303,26 @@ impl RenderState {
         Ok(())
     }
 
-    pub fn get_scale(&self) -> f32 {
-        // During export, use the export scale instead of the workspace zoom.
+    /// CTM scale used when painting into tile work surfaces (`paint_tile_size`).
+    pub fn get_paint_scale(&self) -> f32 {
+        if let Some((_, export_scale)) = self.export_context {
+            return export_scale;
+        }
+        tiles::tile_paint_scale(self.viewbox.zoom(), self.surfaces.paint_tile_size())
+    }
+
+    /// Device scale for the viewport canvas (`zoom × dpr`, uncapped).
+    pub fn get_view_scale(&self) -> f32 {
         if let Some((_, export_scale)) = self.export_context {
             return export_scale;
         }
         self.viewbox.get_scale()
+    }
+
+    /// Alias for [`Self::get_paint_scale`]. Prefer the explicit name in new code;
+    /// tile raster historically called this `get_scale`.
+    pub fn get_scale(&self) -> f32 {
+        self.get_paint_scale()
     }
 
     pub fn zoom_changed(&self) -> bool {

@@ -17,6 +17,11 @@
 
 ## Tile/render behavior
 
+- Three device sizes (do not conflate): `paint_tile_size(dpr)` (raster/Current, capped),
+  `atlas_slot_size(paint, atlas)` (tile_atlas packing), `screen_tile_size(dpr)` (Target/
+  Backbuffer placement, uncapped `512×dpr`). Doc grid is zoom-only: `512/zoom`.
+- Scales: `get_paint_scale()` matches tile CTM; `get_view_scale()` is `zoom×dpr` for
+  viewport/backbuffer mapping. `get_scale()` is an alias of paint scale (legacy name).
 - Interactive transforms are distinct from viewport fast mode. `set_modifiers_start` enables fast mode and interactive transform; interactive transform still flushes each animation frame.
 - During interactive transform, modifier tile invalidation is deferred to `render()` once per rAF. Outside interactive transform, `set_modifiers` rebuilds modifier tiles immediately.
 - `set_modifiers_end` disables fast/interactive state and cancels pending async render; the caller must request the final full-quality render.

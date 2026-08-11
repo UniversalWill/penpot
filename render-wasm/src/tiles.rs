@@ -31,13 +31,14 @@ impl Tile {
         )
     }
 
+    /// Screen-space rect for this tile using the physical tile size (512×dpr).
     #[inline(always)]
-    pub fn get_rect_with_offset(&self, offset: &skia::Point) -> skia::Rect {
+    pub fn get_rect_with_offset(&self, offset: &skia::Point, screen_tile: f32) -> skia::Rect {
         skia::Rect::from_xywh(
-            self.0 as f32 * TILE_SIZE - offset.x,
-            self.1 as f32 * TILE_SIZE - offset.y,
-            TILE_SIZE,
-            TILE_SIZE,
+            self.0 as f32 * screen_tile - offset.x,
+            self.1 as f32 * screen_tile - offset.y,
+            screen_tile,
+            screen_tile,
         )
     }
 }
@@ -211,9 +212,75 @@ impl TileViewbox {
 
 pub const TILE_SIZE: f32 = 512.;
 
+/// Max edge (px) for tile **paint** work surfaces (`Current`, shadows, …).
+///
+/// Without a cap, `512 × dpr` at DPR 4 yields 2048px tiles and 4096² effect
+/// surfaces (~512 MB GPU for the scratchpads alone) and freezes on zoom.
+pub const TILE_PAINT_SIZE_CAP: i32 = 1024;
+
+/// Minimum atlas grid side so large paint tiles still pack enough slots
+/// (e.g. 4096/8 → 512px slots → 64 entries).
+pub const ATLAS_MIN_SLOTS_SIDE: i32 = 8;
+
+// ---------------------------------------------------------------------------
+// Three tile sizes (keep these distinct — mixing them caused HiDPI bugs):
+//
+//   paint_tile_size(dpr)  — raster into Current/effects (capped)
+//   atlas_slot_size(...)  — packing cell in tile_atlas (≤ paint, capacity)
+//   screen_tile_size(dpr) — placement on Target/Backbuffer (`512 × dpr`)
+//
+// Doc grid stays zoom-only: get_tile_size(zoom) = 512 / zoom.
+// ---------------------------------------------------------------------------
+
+/// Document-space size of one tile. Depends only on zoom (not DPR), so the
+/// shape→tile grid stays stable across HiDPI.
 #[inline(always)]
-pub fn get_tile_dimensions() -> skia::ISize {
-    (TILE_SIZE as i32, TILE_SIZE as i32).into()
+pub fn get_tile_size(zoom: f32) -> f32 {
+    TILE_SIZE / zoom
+}
+
+/// GPU **paint** tile edge: `min(round(512 × dpr), TILE_PAINT_SIZE_CAP)`.
+/// Sizes Current/effect surfaces and the paint CTM ([`tile_paint_scale`]).
+#[inline(always)]
+pub fn paint_tile_size(dpr: f32) -> i32 {
+    let ideal = (TILE_SIZE * dpr).round().max(1.0) as i32;
+    ideal.min(TILE_PAINT_SIZE_CAP)
+}
+
+/// Continuous **screen** size of one tile on Target/Backbuffer (`512 × dpr`,
+/// uncapped). Atlas compose upscales from [`atlas_slot_size`] / paint when
+/// the paint budget is below this.
+#[inline(always)]
+pub fn screen_tile_size(dpr: f32) -> f32 {
+    TILE_SIZE * dpr
+}
+
+/// Integer screen tile edge for mosaic layout (cache surface, etc.).
+#[inline(always)]
+pub fn screen_tile_size_i32(dpr: f32) -> i32 {
+    screen_tile_size(dpr).ceil().max(1.0) as i32
+}
+
+/// Atlas pack size: full paint tile when it fits, otherwise capped so the
+/// atlas always has at least `ATLAS_MIN_SLOTS_SIDE²` slots.
+#[inline(always)]
+pub fn atlas_slot_size(paint_size: i32, atlas_texture_size: i32) -> i32 {
+    let paint_size = paint_size.max(1);
+    let atlas_texture_size = atlas_texture_size.max(1);
+    let max_slot = (atlas_texture_size / ATLAS_MIN_SLOTS_SIDE).max(1);
+    paint_size.min(max_slot)
+}
+
+/// CTM scale that maps a zoom-only doc tile onto an integer paint texture.
+#[inline(always)]
+pub fn tile_paint_scale(zoom: f32, paint_size: i32) -> f32 {
+    paint_size as f32 * zoom / TILE_SIZE
+}
+
+#[inline(always)]
+pub fn get_tile_dimensions(dpr: f32) -> skia::ISize {
+    let s = paint_tile_size(dpr);
+    (s, s).into()
 }
 
 pub fn get_tiles_for_rect(rect: skia::Rect, tile_size: f32) -> TileRect {
@@ -227,7 +294,7 @@ pub fn get_tiles_for_rect(rect: skia::Rect, tile_size: f32) -> TileRect {
 }
 
 pub fn get_tiles_for_viewbox(viewbox: &Viewbox) -> TileRect {
-    let tile_size = get_tile_size(viewbox.get_scale());
+    let tile_size = get_tile_size(viewbox.zoom());
     get_tiles_for_rect(viewbox.area, tile_size)
 }
 
@@ -241,20 +308,14 @@ pub fn get_tile_center_for_viewbox(viewbox: &Viewbox) -> Tile {
     Tile((ex - sx) / 2, (ey - sy) / 2)
 }
 
-pub fn get_tile_pos(Tile(x, y): Tile, scale: f32) -> (f32, f32) {
-    (
-        x as f32 * get_tile_size(scale),
-        y as f32 * get_tile_size(scale),
-    )
+pub fn get_tile_pos(Tile(x, y): Tile, zoom: f32) -> (f32, f32) {
+    let ts = get_tile_size(zoom);
+    (x as f32 * ts, y as f32 * ts)
 }
 
-pub fn get_tile_size(scale: f32) -> f32 {
-    1. / scale * TILE_SIZE
-}
-
-pub fn get_tile_rect(tile: Tile, scale: f32) -> skia::Rect {
-    let (tx, ty) = get_tile_pos(tile, scale);
-    let ts = get_tile_size(scale);
+pub fn get_tile_rect(tile: Tile, zoom: f32) -> skia::Rect {
+    let (tx, ty) = get_tile_pos(tile, zoom);
+    let ts = get_tile_size(zoom);
     skia::Rect::from_xywh(tx, ty, ts, ts)
 }
 
@@ -402,5 +463,49 @@ impl PendingTiles {
 
     pub fn pop(&mut self) -> Option<Tile> {
         self.list.pop()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paint_tile_size_matches_ideal_until_cap() {
+        assert_eq!(paint_tile_size(1.0), 512);
+        assert_eq!(paint_tile_size(2.0), 1024);
+        assert_eq!(paint_tile_size(2.0), TILE_PAINT_SIZE_CAP);
+    }
+
+    #[test]
+    fn paint_tile_size_caps_high_dpr() {
+        assert_eq!(paint_tile_size(3.0), TILE_PAINT_SIZE_CAP);
+        assert_eq!(paint_tile_size(4.0), TILE_PAINT_SIZE_CAP);
+        assert_eq!(paint_tile_size(4.0), 1024);
+    }
+
+    #[test]
+    fn screen_tile_size_stays_uncapped() {
+        assert_eq!(screen_tile_size(4.0), 2048.0);
+        assert!(screen_tile_size(4.0) > paint_tile_size(4.0) as f32);
+    }
+
+    #[test]
+    fn paint_scale_diverges_from_view_scale_when_capped() {
+        let zoom = 1.0;
+        let dpr = 4.0;
+        let paint = tile_paint_scale(zoom, paint_tile_size(dpr));
+        let view = zoom * dpr;
+        assert_eq!(paint, 2.0);
+        assert_eq!(view, 4.0);
+        assert!(paint < view);
+    }
+
+    #[test]
+    fn atlas_slot_preserves_paint_when_atlas_is_large_enough() {
+        // 8192 / 8 = 1024 → paint 1024 fits at full res with 64 slots.
+        assert_eq!(atlas_slot_size(1024, 8192), 1024);
+        assert_eq!(atlas_slot_size(1024, 4096), 512);
+        assert_eq!(atlas_slot_size(512, 4096), 512);
     }
 }

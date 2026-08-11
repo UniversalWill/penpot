@@ -151,13 +151,17 @@ Tile caching (via `TileTextureCache`) boosts performance:
 
 ## Scaling and Tile Size Utilities
 
-Tile size in screen space is constant, but its actual visual size depends on zoom level (`scale`).
+The **document** tile grid depends only on zoom (`get_tile_size(zoom) = 512 / zoom`),
+so a shape occupies the same tiles at any DPR. Paint scale remains `zoom × dpr` for
+HiDPI sharpness, and each GPU tile slot is `512 × dpr` device pixels.
 
-To deal with this, the system uses utility functions:
+Utility functions:
 
-- `get_tile_size(scale)`: Gets the logical size of a tile at the current scale.
-- `get_tile_rect(tile, scale)`: Gets the rectangular area a tile covers.
-- `get_tile_pos(tile, scale)`: Gets the tile’s position in canvas coordinates.
+- `get_tile_size(zoom)`: Document-space size of one tile (DPR-independent).
+- `get_tile_rect(tile, zoom)` / `get_tile_pos(tile, zoom)`: Doc-space geometry.
+- `physical_tile_size(dpr)`: GPU edge length `round(512 × dpr)`.
+- `screen_tile_size(dpr)`: continuous Target placement size `512 × dpr`.
+- `tile_paint_scale(zoom, phys)`: CTM that fills the integer GPU tile.
 
 These allow rendering logic to adapt tile positions/sizes dynamically.
 
