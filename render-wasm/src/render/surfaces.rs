@@ -477,7 +477,10 @@ impl Surfaces {
         tile_dims: skia::ISize,
     ) -> Result<Self> {
         let gpu_state = get_gpu_state();
-        let paint_size = tile_dims.width.max(1);
+        // Never allocate Current larger than atlas slots can store: overpainting
+        // is discarded on pack and spikes zoom-settle cost on large HiDPI views.
+        let max_texture_size = gpu_state.max_texture_size();
+        let paint_size = tiles::atlas_slot_size(tile_dims.width.max(1), max_texture_size);
 
         let extra_tile_dims = skia::ISize::new(
             paint_size * TILE_SIZE_MULTIPLIER,
@@ -491,7 +494,6 @@ impl Surfaces {
         let backbuffer =
             gpu_state.create_surface_with_dimensions("backbuffer".to_string(), width, height)?;
 
-        let max_texture_size = gpu_state.max_texture_size();
         let tile_atlas = gpu_state.create_surface_with_dimensions(
             "tile_atlas".to_string(),
             max_texture_size,
@@ -565,10 +567,10 @@ impl Surfaces {
     }
 
     /// Recreate Current / effect / atlas-slot surfaces when paint size changes.
-    /// High DPRs that share the same capped paint size return `false`.
+    /// High DPRs that share the same atlas-clamped paint size return `false`.
     pub fn set_dpr(&mut self, dpr: f32) -> Result<bool> {
         self.dpr = dpr;
-        let new_paint = tiles::paint_tile_size(dpr);
+        let new_paint = tiles::effective_paint_tile_size(dpr, self.tile_atlas.width());
         if new_paint == self.paint_size {
             return Ok(false);
         }

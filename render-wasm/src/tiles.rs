@@ -240,11 +240,20 @@ pub fn get_tile_size(zoom: f32) -> f32 {
 }
 
 /// GPU **paint** tile edge: `min(round(512 × dpr), TILE_PAINT_SIZE_CAP)`.
-/// Sizes Current/effect surfaces and the paint CTM ([`tile_paint_scale`]).
+/// Ideal raster size before atlas packing; prefer [`effective_paint_tile_size`]
+/// when allocating Current/effect surfaces so we never paint larger than the
+/// atlas can store (DPR 2 on a 4096² atlas would otherwise paint 1024 and
+/// immediately downscale into 512 slots — pure GPU waste on zoom settle).
 #[inline(always)]
 pub fn paint_tile_size(dpr: f32) -> i32 {
     let ideal = (TILE_SIZE * dpr).round().max(1.0) as i32;
     ideal.min(TILE_PAINT_SIZE_CAP)
+}
+
+/// Paint size that fits the atlas: `min(paint_tile_size(dpr), atlas_slot max)`.
+#[inline(always)]
+pub fn effective_paint_tile_size(dpr: f32, atlas_texture_size: i32) -> i32 {
+    atlas_slot_size(paint_tile_size(dpr), atlas_texture_size)
 }
 
 /// Continuous **screen** size of one tile on Target/Backbuffer (`512 × dpr`,
@@ -384,6 +393,8 @@ pub struct PendingTiles {
     pub visible_uncached: Vec<Tile>,
     pub interest_cached: Vec<Tile>,
     pub interest_uncached: Vec<Tile>,
+    /// Interest-ring tiles deferred until after the viewport has been presented.
+    deferred_interest: Vec<Tile>,
 }
 
 impl PendingTiles {
@@ -396,14 +407,16 @@ impl PendingTiles {
             visible_uncached: Vec::with_capacity(VIEWPORT_DEFAULT_CAPACITY),
             interest_cached: Vec::with_capacity(VIEWPORT_DEFAULT_CAPACITY),
             interest_uncached: Vec::with_capacity(VIEWPORT_DEFAULT_CAPACITY),
+            deferred_interest: Vec::with_capacity(VIEWPORT_DEFAULT_CAPACITY),
         }
     }
 
     pub fn update(&mut self, tile_viewbox: &TileViewbox, surfaces: &Surfaces, only_visible: bool) {
         self.list.clear();
+        self.deferred_interest.clear();
 
         // During interactive transform, skip the interest-area ring
-        // entirely — the user is dragging, every rAF is on the critical
+        // entirely: the user is dragging, every rAF is on the critical
         // path, and pre-rendering tiles outside the viewport is wasted
         // work that just gets evicted on the next pointer move. The ring
         // is repopulated naturally on gesture end / on idle rAFs.
@@ -455,10 +468,29 @@ impl PendingTiles {
             }
         }
 
-        self.list.extend(self.interest_uncached.iter());
-        self.list.extend(self.interest_cached.iter());
-        self.list.extend(self.visible_uncached.iter());
-        self.list.extend(self.visible_cached.iter());
+        // Visible tiles first. Interest-ring work is deferred so we can present
+        // as soon as the viewport is ready (see `promote_deferred_interest`).
+        // Interactive/`only_visible` already excludes the ring from `tile_rect`.
+        if only_visible {
+            self.list.extend(self.visible_uncached.iter());
+            self.list.extend(self.visible_cached.iter());
+        } else {
+            self.deferred_interest
+                .extend(self.interest_uncached.iter());
+            self.deferred_interest.extend(self.interest_cached.iter());
+            self.list.extend(self.visible_uncached.iter());
+            self.list.extend(self.visible_cached.iter());
+        }
+    }
+
+    /// Move deferred interest-ring tiles onto the pending list.
+    /// Returns true when there is interest work left to do.
+    pub fn promote_deferred_interest(&mut self) -> bool {
+        if self.deferred_interest.is_empty() {
+            return false;
+        }
+        self.list.append(&mut self.deferred_interest);
+        true
     }
 
     pub fn pop(&mut self) -> Option<Tile> {
@@ -482,6 +514,14 @@ mod tests {
         assert_eq!(paint_tile_size(3.0), TILE_PAINT_SIZE_CAP);
         assert_eq!(paint_tile_size(4.0), TILE_PAINT_SIZE_CAP);
         assert_eq!(paint_tile_size(4.0), 1024);
+    }
+
+    #[test]
+    fn effective_paint_matches_atlas_slots_on_4096() {
+        // Ideal DPR-2 paint is 1024, but a 4096² atlas only keeps 512 slots.
+        assert_eq!(effective_paint_tile_size(2.0, 4096), 512);
+        assert_eq!(effective_paint_tile_size(1.0, 4096), 512);
+        assert_eq!(effective_paint_tile_size(2.0, 8192), 1024);
     }
 
     #[test]

@@ -20,8 +20,14 @@
 - Three device sizes (do not conflate): `paint_tile_size(dpr)` (raster/Current, capped),
   `atlas_slot_size(paint, atlas)` (tile_atlas packing), `screen_tile_size(dpr)` (Target/
   Backbuffer placement, uncapped `512×dpr`). Doc grid is zoom-only: `512/zoom`.
+- Surfaces allocate with `effective_paint_tile_size` = `min(paint, atlas_slot max)` so
+  DPR 2 on a 4096² atlas paints 512 (not 1024→downscale-to-512). Overpainting the atlas
+  was pure GPU waste on zoom settle.
 - Scales: `get_paint_scale()` matches tile CTM; `get_view_scale()` is `zoom×dpr` for
   viewport/backbuffer mapping. `get_scale()` is an alias of paint scale (legacy name).
+- Zoom settle: visible tiles present via `FrameType::ViewportReady` before interest-ring
+  work; crop-cache rebuild is deferred to the later `Full` so the soft→sharp snap is
+  compose+present only.
 - Interactive transforms are distinct from viewport fast mode. `set_modifiers_start` enables fast mode and interactive transform; interactive transform still flushes each animation frame.
 - During interactive transform, modifier tile invalidation is deferred to `render()` once per rAF. Outside interactive transform, `set_modifiers` rebuilds modifier tiles immediately.
 - `set_modifiers_end` disables fast/interactive state and cancels pending async render; the caller must request the final full-quality render.
