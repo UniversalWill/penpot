@@ -874,30 +874,18 @@
   nil)
 
 
-(defn- get-texture-id-for-gl-object
-  "Registers a WebGL texture with Emscripten's GL object system and returns its ID"
-  [texture]
-  (let [gl-obj (unchecked-get wasm/internal-module "GL")
-        textures (.-textures ^js gl-obj)
-        new-id (.getNewId ^js gl-obj textures)]
-    (aset textures new-id texture)
-    new-id))
-
-(defn- svg-blob?
-  [^js blob]
-  (str/starts-with? (.-type blob) "image/svg"))
-
-(defn- store-svg-image
-  "Sends raw SVG bytes to WASM so Skia parses and rasterizes them there.
-   Browsers reject SVG blobs in `createImageBitmap`, so SVGs skip the
-   shared-texture path."
+(defn- store-image-bytes
+  "Sends encoded image bytes to WASM. Rust keeps them in RAM and builds the
+   GPU display tier (shape @ 100% zoom); full native stays lazy for deep zoom.
+   Used for both SVG and raster fills so we never upload a full-res GL texture
+   from JS."
   [shape-id image-id thumbnail? ^js blob]
   (-> (.arrayBuffer blob)
       (p/then
        (fn [buffer]
          (let [image-bytes (js/Uint8Array. buffer)
                ;; Header: 16 bytes shape uuid + 16 bytes image uuid
-               ;; + 4 bytes thumbnail flag, then the raw SVG payload.
+               ;; + 4 bytes thumbnail flag, then the encoded payload.
                offset (mem/alloc (+ 36 (.-byteLength image-bytes)))
                heap   (mem/get-heap-u8)
                dview  (mem/get-data-view)]
@@ -909,46 +897,9 @@
            (h/call wasm/internal-module "_store_image")
            true)))))
 
-(defn- store-image-texture
-  "Creates a WebGL texture from a decoded image and passes the texture ID to
-   WASM. This avoids decoding the image twice (once in browser, once in WASM)."
-  [shape-id image-id thumbnail? img]
-  (when-let [gl (webgl/get-webgl-context)]
-    (let [texture (webgl/create-webgl-texture-from-image gl img)
-          texture-id (get-texture-id-for-gl-object texture)
-          width  (.-width ^js img)
-          height (.-height ^js img)
-          ;; Header: 32 bytes (2 UUIDs) + 4 bytes (thumbnail)
-          ;;     + 4 bytes (texture ID) + 8 bytes (dimensions)
-          total-bytes 48
-          offset (mem/alloc->offset-32 total-bytes)
-          heap32 (mem/get-heap-u32)]
-
-      ;; 1. Set shape id (offset + 0 to offset + 3)
-      (mem.h32/write-uuid offset heap32 shape-id)
-
-      ;; 2. Set image id (offset + 4 to offset + 7)
-      (mem.h32/write-uuid (+ offset 4) heap32 image-id)
-
-      ;; 3. Set thumbnail flag as u32 (offset + 8)
-      (aset heap32 (+ offset 8) (if thumbnail? 1 0))
-
-      ;; 4. Set texture ID (offset + 9)
-      (aset heap32 (+ offset 9) texture-id)
-
-      ;; 5. Set width (offset + 10)
-      (aset heap32 (+ offset 10) width)
-
-      ;; 6. Set height (offset + 11)
-      (aset heap32 (+ offset 11) height)
-
-      (h/call wasm/internal-module "_store_image_from_texture")
-      true)))
-
 (defn- fetch-image
-  "Loads an image and hands it to WASM. Raster images are decoded by the
-   browser and shared as a WebGL texture; SVG images are sent as raw bytes
-   so Skia rasterizes them."
+  "Loads an image and hands encoded bytes to WASM (`_store_image`). LOD /
+   display-vs-full GPU tiers are handled entirely in Rust."
   [shape-id image-id thumbnail?]
   (let [url (cf/resolve-file-media {:id image-id} thumbnail?)]
     {:key url
@@ -959,11 +910,7 @@
                          (p/then (fn [^js response] (.blob response)))))
             (rx/mapcat
              (fn [^js blob]
-               (rx/from
-                (if (svg-blob? blob)
-                  (store-svg-image shape-id image-id thumbnail? blob)
-                  (p/then (js/createImageBitmap blob)
-                          (partial store-image-texture shape-id image-id thumbnail?))))))
+               (rx/from (store-image-bytes shape-id image-id thumbnail? blob))))
             (rx/catch
              (fn [cause]
                (log/error :hint "Could not fetch image"
@@ -1005,7 +952,7 @@
 (defn set-shape-fills
   [shape-id fills thumbnail?]
   ;; Record write is shared with the headless exporter; the image fetch below is
-  ;; browser-only (WebGL textures).
+  ;; browser-only (bytes → Rust ImageStore).
   (when-let [fills (props/write-shape-fills! fills)]
     (keep (fn [id]
             (let [buffer        (uuid/get-u32 id)
@@ -1022,7 +969,7 @@
 (defn set-shape-strokes
   [shape-id strokes thumbnail?]
   ;; Record write is shared with the headless exporter; the image fetch below is
-  ;; browser-only (WebGL textures).
+  ;; browser-only (bytes → Rust ImageStore).
   (keep (fn [image-id]
           (let [buffer        (uuid/get-u32 image-id)
                 cached-image? (h/call wasm/internal-module "_is_image_cached"

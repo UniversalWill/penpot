@@ -127,10 +127,22 @@ pub extern "C" fn store_image() -> Result<()> {
     let image_bytes = &bytes[IMAGE_HEADER_SIZE..];
 
     with_state!(state, {
-        if let Err(msg) = get_resources()
-            .images
-            .add(ids.image_id, is_thumbnail, image_bytes)
-        {
+        let display_side = if is_thumbnail {
+            None
+        } else {
+            state.shapes.get(&ids.shape_id).map(|shape| {
+                // Display tier = shape size at 100% zoom in device pixels (× dpr).
+                let dpr = crate::get_render_state().options.dpr.max(1.0);
+                crate::render::images::shape_side_px(&shape.selrect, dpr)
+            })
+        };
+
+        if let Err(msg) = get_resources().images.add(
+            ids.image_id,
+            is_thumbnail,
+            image_bytes,
+            display_side,
+        ) {
             eprintln!("{}", msg);
         }
         touch_shapes_with_image(state, ids.image_id);

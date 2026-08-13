@@ -4,7 +4,7 @@ pub mod filters;
 mod fonts;
 pub mod gpu_state;
 pub mod grid_layout;
-mod images;
+pub mod images;
 mod options;
 pub mod pdf;
 pub mod raster;

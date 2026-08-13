@@ -568,7 +568,15 @@ fn draw_image_stroke_in_container(
     } else {
         stroke
     };
-    let Some(image) = get_resources().images.get(&image_fill.id()) else {
+    let view_scale = render_state.get_view_scale();
+    let dpr = render_state.options.dpr.max(1.0);
+    let display_side = super::images::shape_side_px(&shape.selrect, dpr);
+    let needed_side = super::images::shape_side_px(&shape.selrect, view_scale);
+    let Some(image) = get_resources().images.get_for_draw(
+        &image_fill.id(),
+        display_side,
+        needed_side,
+    ) else {
         return Ok(());
     };
 
